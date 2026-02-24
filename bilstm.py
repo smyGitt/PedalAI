@@ -60,13 +60,13 @@ def train_bilstm(tensor_dir, checkpoint_path, epochs=10, save_every_n_files=50):
     
     dataset = MaestroFullSequenceDataset(tensor_dir)
     
-    # DataLoader optimized for single-batch full-sequence ingestion
+    # DataLoader optimized for multi-core desktop environment (32GB RAM / RTX 3080)
     dataloader = DataLoader(
         dataset, 
         batch_size=1, 
         shuffle=True, 
-        num_workers=2, 
-        pin_memory=True
+        num_workers=8,       # Spawns 8 asynchronous subprocesses for parallel I/O and deserialization
+        pin_memory=True      # Allocates page-locked memory for high-bandwidth DMA transfers to VRAM
     )
     
     model = BiLSTMPedalRegressor().to(device)
