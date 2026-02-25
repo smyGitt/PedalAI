@@ -1,3 +1,5 @@
 maestro_tensors_tbptt/
 venv/
 vscode/
+onnxExport.py
+*.onnx
