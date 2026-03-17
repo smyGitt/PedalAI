@@ -32,8 +32,12 @@ def export_and_validate(checkpoint_path=CHECKPOINT_PATH, onnx_path=ONNX_PATH):
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     base_model.load_state_dict(checkpoint['model_state_dict'])
-    base_model.lstm.flatten_parameters()
     base_model.eval()
+
+    # Sanity-check for NaN weights from a diverged training run.
+    nan_params = [(n, p) for n, p in base_model.named_parameters() if not torch.isfinite(p).all()]
+    if nan_params:
+        raise ValueError(f"Checkpoint contains non-finite weights in: {[n for n, _ in nan_params]}")
 
     # Wrap with sigmoid so the ONNX output is a pedal probability in [0, 1].
     # Apply threshold >= 0.5 at inference to obtain binary pedal on/off.

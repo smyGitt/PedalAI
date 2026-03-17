@@ -80,7 +80,12 @@ def train_tbptt(tensor_dir, checkpoint_path, epochs=10, chunk_size=1000, save_ev
         for file_idx, (x_full, y_full) in enumerate(dataloader):
             x_full = x_full.to(device, non_blocking=True)
             y_full = y_full.to(device, non_blocking=True)
-            
+
+            if torch.isnan(x_full).any() or torch.isnan(y_full).any():
+                print(f"  [WARNING] NaN in input data for file {file_idx+1} ({dataset.file_names[file_idx]}) — skipping file")
+                files_processed += 1
+                continue
+
             total_time_steps = x_full.size(1)
             hidden_states = None
             
@@ -103,12 +108,18 @@ def train_tbptt(tensor_dir, checkpoint_path, epochs=10, chunk_size=1000, save_ev
                     loss_total = (weight_classification * loss_c) + (weight_regression * loss_r)
                 
                 hidden_states = tuple(h.detach() for h in hidden_states)
-                
+
                 scaler.scale(loss_total).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
-                
-                running_loss += loss_total.item()
+
+                loss_val = loss_total.item()
+                if torch.isnan(loss_total) or torch.isinf(loss_total):
+                    print(f"  [WARNING] NaN/Inf loss at file {file_idx+1}, chunk t={t} — skipping accumulation")
+                    continue
+                running_loss += loss_val
                 total_epoch_chunks += 1
                 
             files_processed += 1
