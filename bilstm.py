@@ -8,19 +8,53 @@ from tqdm import tqdm
 
 
 class PedalDataset(Dataset):
-    def __init__(self, zip_path):
-        self.zip_path = zip_path
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            self.names = [n for n in zf.namelist() if n.endswith('.pt')]
+    MANIFEST_NAME = 'training_tensors_manifest.txt'
+
+    def __init__(self, zip_path, folder_paths=None):
+        """Load .pt files from an extracted folder (preferred) or zip fallback.
+
+        Args:
+            zip_path: Path to the zip archive (used as fallback).
+            folder_paths: List of candidate folder paths to check for extracted
+                          .pt files (e.g. external SSD mount points). The first
+                          folder that exists and contains .pt files is used.
+        """
+        self.folder = None
+        self.zip_path = None
+
+        # Try extracted folder — much faster I/O than zip
+        for folder in (folder_paths or []):
+            manifest = os.path.join(folder, self.MANIFEST_NAME)
+            if os.path.isdir(folder) and os.path.exists(manifest):
+                with open(manifest, 'r') as f:
+                    self.names = [line.strip() for line in f if line.strip()]
+                folder_files = set(os.listdir(folder))
+                if all(n in folder_files for n in self.names):
+                    self.folder = folder
+                    print(f"Using extracted folder: {folder} ({len(self.names)} files)")
+                    break
+                else:
+                    missing = [n for n in self.names if n not in folder_files]
+                    print(f"[WARNING] Folder {folder} is missing {len(missing)} files, falling back to zip")
+
+        # Fall back to zip
+        if self.folder is None:
+            self.zip_path = zip_path
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                self.names = [os.path.basename(n) for n in zf.namelist() if n.endswith('.pt')]
+            print(f"Using zip archive: {zip_path} ({len(self.names)} files)")
 
     def __len__(self):
         return len(self.names)
 
     def __getitem__(self, idx):
-        # Open zip per-call — required for multiprocessing worker safety
-        with zipfile.ZipFile(self.zip_path, 'r') as zf:
-            with zf.open(self.names[idx]) as f:
-                data = torch.load(io.BytesIO(f.read()), weights_only=True)
+        if self.folder is not None:
+            data = torch.load(os.path.join(self.folder, self.names[idx]), weights_only=True)
+        else:
+            # Open zip per-call — required for multiprocessing worker safety
+            with zipfile.ZipFile(self.zip_path, 'r') as zf:
+                with zf.open('training_tensors/' + self.names[idx]) as f:
+                    data = torch.load(io.BytesIO(f.read()), weights_only=True)
         x = data['x'].squeeze(0)  # (T, 128)
         # Compute 12-dim chroma by summing pitch activations across octaves
         chroma = torch.stack([x[:, c::12].sum(dim=1) for c in range(12)], dim=1)  # (T, 12)
@@ -38,7 +72,6 @@ class BiLSTMPedalRegressor(nn.Module):
             batch_first=True,
             bidirectional=True,
         )
-        self.lstm.flatten_parameters()
         # Regression head: [hidden*2] -> [1]
         self.regression_head = nn.Linear(hidden_size * 2, 1)
 
@@ -69,7 +102,7 @@ def _has_nan_weights(model):
     return [n for n, p in model.named_parameters() if not torch.isfinite(p).all()]
 
 
-def train_bilstm(zip_path, checkpoint_path, epochs=10, save_every_n_files=50, validation_split=0.1):
+def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_every_n_files=50, validation_split=0.1):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Training on: {device}")
 
@@ -78,7 +111,7 @@ def train_bilstm(zip_path, checkpoint_path, epochs=10, save_every_n_files=50, va
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
 
-    dataset = PedalDataset(zip_path)
+    dataset = PedalDataset(zip_path, folder_paths=folder_paths)
     dataset_size = len(dataset)
     val_size = int(dataset_size * validation_split)
     train_size = dataset_size - val_size
@@ -385,4 +418,10 @@ ZIP_PATH = 'training_tensors.zip'
 CHECKPOINT_PATH = 'pedal_bilstm_checkpoint.pt'
 
 if __name__ == '__main__':
-    train_bilstm(ZIP_PATH, CHECKPOINT_PATH)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--tensor-dir', type=str, default=None,
+                        help='Absolute path to extracted training tensor folder (e.g. E:/training_tensors)')
+    args = parser.parse_args()
+    folder_paths = [args.tensor_dir] if args.tensor_dir else None
+    train_bilstm(ZIP_PATH, CHECKPOINT_PATH, folder_paths=folder_paths)
