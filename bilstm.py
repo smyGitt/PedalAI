@@ -185,6 +185,7 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
         num_workers=8,
         pin_memory=True,
         persistent_workers=True,
+        prefetch_factor=4,
     )
 
     for epoch in range(start_epoch, epochs):
