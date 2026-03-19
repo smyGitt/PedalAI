@@ -1,4 +1,7 @@
 onnxExport.py
+*.npz
 *.onnx
 *.zip
 */
+!scripts/
+!eval/

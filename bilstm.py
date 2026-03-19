@@ -63,7 +63,7 @@ class PedalDataset(Dataset):
 
 
 class BiLSTMPedalRegressor(nn.Module):
-    def __init__(self, input_size=140, hidden_size=256, num_layers=2):
+    def __init__(self, input_size=140, hidden_size=256, num_layers=2, dropout=0.3):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_size,
@@ -72,6 +72,7 @@ class BiLSTMPedalRegressor(nn.Module):
             batch_first=True,
             bidirectional=True,
         )
+        self.dropout = nn.Dropout(dropout)
         # Regression head: [hidden*2] -> [1]
         self.regression_head = nn.Linear(hidden_size * 2, 1)
 
@@ -82,7 +83,7 @@ class BiLSTMPedalRegressor(nn.Module):
         if x.is_cuda:
             self.lstm.flatten_parameters()
         lstm_out, _ = self.lstm(x.contiguous())
-        return self.regression_head(lstm_out)
+        return self.regression_head(self.dropout(lstm_out))
 
 
 def _save_checkpoint(path, state):
@@ -135,8 +136,9 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
 
-    # BCEWithLogitsLoss expects raw logits; sigmoid is applied internally for stability
-    criterion = nn.BCEWithLogitsLoss()
+    # BCEWithLogitsLoss expects raw logits; sigmoid is applied internally for stability.
+    # reduction='none' returns per-element loss, allowing masked averaging for padded chunks.
+    criterion = nn.BCEWithLogitsLoss(reduction='none')
 
     # AMP GradScaler is only meaningful on CUDA. When disabled (CPU), it is a
     # transparent no-op — but critically it does NOT provide NaN/Inf guard on CPU,
@@ -168,6 +170,7 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
         print(f"Resumed from epoch {start_epoch}, file offset {file_offset}")
 
     CHUNK_SIZE = 512
+    MAX_BATCH_CHUNKS = 200  # ~102,400 frames (~34 min at 50Hz) — OOM safety cap
     # Abort training if this many consecutive NaN events (chunks or file-level
     # grad checks) occur without a successful optimizer step in between.
     MAX_CONSECUTIVE_NAN = 20
@@ -240,52 +243,89 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
 
             T = x_full.shape[1]
             file_loss = 0.0
-            num_chunks = 0
             file_had_nan = False
             num_total_chunks = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-            # Accumulate gradients across all chunks, step once per file.
-            # This reduces optimizer overhead and ensures each file contributes
-            # equally regardless of sequence length.
+            # Pad sequence to exact multiple of CHUNK_SIZE for batched processing
+            pad_len = num_total_chunks * CHUNK_SIZE - T
+            if pad_len > 0:
+                x_full = torch.nn.functional.pad(x_full, (0, 0, 0, pad_len))
+                y_full = torch.nn.functional.pad(y_full, (0, pad_len))
+
+            # Reshape (1, T_padded, F) -> (num_chunks, CHUNK_SIZE, F)
+            x_chunks = x_full.squeeze(0).view(num_total_chunks, CHUNK_SIZE, -1)
+            y_chunks = y_full.squeeze(0).view(num_total_chunks, CHUNK_SIZE)
+
             optimizer.zero_grad(set_to_none=True)
 
-            for start in range(0, T, CHUNK_SIZE):
-                end = min(start + CHUNK_SIZE, T)
-                x_chunk = x_full[:, start:end, :]
-                y_chunk = y_full[:, start:end]
-
+            if num_total_chunks <= MAX_BATCH_CHUNKS:
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                    out_chunk = model(x_chunk).squeeze(-1)
-                    loss = criterion(out_chunk, y_chunk)
+                    out_chunks = model(x_chunks).squeeze(-1)
+                    per_element_loss = criterion(out_chunks, y_chunks)
+                    if pad_len > 0:
+                        mask = torch.ones_like(y_chunks)
+                        mask[-1, CHUNK_SIZE - pad_len:] = 0.0
+                        loss = (per_element_loss * mask).sum() / mask.sum()
+                    else:
+                        loss = per_element_loss.mean()
+            else:
+                # Sub-batch to stay within VRAM limits.
+                # Each sub-batch gets its own backward() call so activations are
+                # freed before the next sub-batch, bounding peak memory.
+                total_loss_sum = 0.0
+                total_frame_count = 0
+                for sb_start in range(0, num_total_chunks, MAX_BATCH_CHUNKS):
+                    sb_end = min(sb_start + MAX_BATCH_CHUNKS, num_total_chunks)
+                    x_sb = x_chunks[sb_start:sb_end]
+                    y_sb = y_chunks[sb_start:sb_end]
+                    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                        out_sb = model(x_sb).squeeze(-1)
+                        sb_loss = criterion(out_sb, y_sb)
+                        if sb_end == num_total_chunks and pad_len > 0:
+                            mask = torch.ones_like(y_sb)
+                            mask[-1, CHUNK_SIZE - pad_len:] = 0.0
+                            sb_mean = (sb_loss * mask).sum() / mask.sum()
+                            sb_count = int(mask.sum().item())
+                        else:
+                            sb_mean = sb_loss.mean()
+                            sb_count = y_sb.numel()
+                    if not torch.isfinite(sb_mean):
+                        file_had_nan = True
+                        break
+                    # Weight this sub-batch's gradient by its share of total real frames
+                    scaler.scale(sb_mean * (sb_count / T)).backward()
+                    total_loss_sum += sb_mean.item() * sb_count
+                    total_frame_count += sb_count
+                # Compute file-level mean loss for reporting
+                if total_frame_count > 0 and not file_had_nan:
+                    loss = torch.tensor(total_loss_sum / total_frame_count)
+                    file_loss = loss.item()
+                else:
+                    loss = torch.tensor(float('nan'))
 
-                # ── NaN/Inf guard ────────────────────────────────────────────────
-                # MUST happen before backward(). Calling backward() on a NaN loss
-                # propagates NaN gradients through all parameters. On CPU the AMP
-                # scaler is disabled and provides no protection, so optimizer.step()
-                # would write NaN values into the weights — corrupting the checkpoint.
-                if not torch.isfinite(loss):
-                    consecutive_nan += 1
-                    file_had_nan = True
-                    tqdm.write(
-                        f"[WARNING] Non-finite loss at epoch {epoch + 1}, "
-                        f"file '{current_filename}', chunk [{start}:{end}]. "
-                        f"Skipping backward. ({consecutive_nan}/{MAX_CONSECUTIVE_NAN})"
+            # ── NaN/Inf guard ────────────────────────────────────────────────
+            if not torch.isfinite(loss):
+                consecutive_nan += 1
+                file_had_nan = True
+                tqdm.write(
+                    f"[WARNING] Non-finite loss at epoch {epoch + 1}, "
+                    f"file '{current_filename}'. "
+                    f"Skipping backward. ({consecutive_nan}/{MAX_CONSECUTIVE_NAN})"
+                )
+                if consecutive_nan >= MAX_CONSECUTIVE_NAN:
+                    raise RuntimeError(
+                        f"Training aborted: {MAX_CONSECUTIVE_NAN} consecutive "
+                        "NaN/Inf losses. The model has diverged — check your "
+                        "data quality and consider lowering the learning rate."
                     )
-                    if consecutive_nan >= MAX_CONSECUTIVE_NAN:
-                        raise RuntimeError(
-                            f"Training aborted: {MAX_CONSECUTIVE_NAN} consecutive "
-                            "NaN/Inf losses. The model has diverged — check your "
-                            "data quality and consider lowering the learning rate."
-                        )
-                    continue
-                # ────────────────────────────────────────────────────────────────
-
-                # Normalize loss by total chunks so gradient magnitude is
-                # independent of sequence length.
-                scaler.scale(loss / num_total_chunks).backward()
-
-                file_loss += loss.item()
-                num_chunks += 1
+            elif num_total_chunks <= MAX_BATCH_CHUNKS:
+                # Standard path: single forward, single backward
+                scaler.scale(loss).backward()
+                file_loss = loss.item()
+            # Sub-batch path: backward already called per sub-batch,
+            # file_loss already set above.
+            # ────────────────────────────────────────────────────────────────
+            num_chunks = num_total_chunks if torch.isfinite(loss) else 0
 
             # Single optimizer step per file — only if at least one chunk was clean
             if num_chunks > 0:
@@ -319,10 +359,9 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
                 nan_filenames.append(current_filename)
 
             if num_chunks > 0:
-                avg_file_loss = file_loss / num_chunks
-                running_loss += avg_file_loss
+                running_loss += file_loss
                 files_with_loss += 1
-                epoch_iterator.set_postfix(BCE_Loss=f"{avg_file_loss:.4f}")
+                epoch_iterator.set_postfix(BCE_Loss=f"{file_loss:.4f}")
 
             if (file_idx + 1) % save_every_n_files == 0:
                 bad = _has_nan_weights(model)
@@ -369,21 +408,46 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
                 y_val = y_val.to(device, non_blocking=True).float()
 
                 T_val = x_val.shape[1]
-                file_val_loss = 0.0
-                num_val_chunks = 0
+                num_val_chunks = (T_val + CHUNK_SIZE - 1) // CHUNK_SIZE
+                pad_len = num_val_chunks * CHUNK_SIZE - T_val
 
-                for start in range(0, T_val, CHUNK_SIZE):
-                    end = min(start + CHUNK_SIZE, T_val)
+                if pad_len > 0:
+                    x_val = torch.nn.functional.pad(x_val, (0, 0, 0, pad_len))
+                    y_val = torch.nn.functional.pad(y_val, (0, pad_len))
+
+                x_vchunks = x_val.squeeze(0).view(num_val_chunks, CHUNK_SIZE, -1)
+                y_vchunks = y_val.squeeze(0).view(num_val_chunks, CHUNK_SIZE)
+
+                if num_val_chunks <= MAX_BATCH_CHUNKS:
                     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                        out_chunk = model(x_val[:, start:end, :]).squeeze(-1)
-                        v_loss = criterion(out_chunk, y_val[:, start:end])
-                    if not torch.isfinite(v_loss):
-                        continue
-                    file_val_loss += v_loss.item()
-                    num_val_chunks += 1
+                        out_vchunks = model(x_vchunks).squeeze(-1)
+                        per_element_loss = criterion(out_vchunks, y_vchunks)
+                        if pad_len > 0:
+                            mask = torch.ones_like(y_vchunks)
+                            mask[-1, CHUNK_SIZE - pad_len:] = 0.0
+                            v_loss = (per_element_loss * mask).sum() / mask.sum()
+                        else:
+                            v_loss = per_element_loss.mean()
+                else:
+                    total_vloss_sum = 0.0
+                    total_vframe_count = 0
+                    for sb_start in range(0, num_val_chunks, MAX_BATCH_CHUNKS):
+                        sb_end = min(sb_start + MAX_BATCH_CHUNKS, num_val_chunks)
+                        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                            out_sb = model(x_vchunks[sb_start:sb_end]).squeeze(-1)
+                            sb_loss = criterion(out_sb, y_vchunks[sb_start:sb_end])
+                            if sb_end == num_val_chunks and pad_len > 0:
+                                mask = torch.ones_like(y_vchunks[sb_start:sb_end])
+                                mask[-1, CHUNK_SIZE - pad_len:] = 0.0
+                                total_vloss_sum += (sb_loss * mask).sum().item()
+                                total_vframe_count += int(mask.sum().item())
+                            else:
+                                total_vloss_sum += sb_loss.sum().item()
+                                total_vframe_count += y_vchunks[sb_start:sb_end].numel()
+                    v_loss = torch.tensor(total_vloss_sum / total_vframe_count if total_vframe_count > 0 else float('nan'))
 
-                if num_val_chunks > 0:
-                    val_loss += file_val_loss / num_val_chunks
+                if torch.isfinite(v_loss):
+                    val_loss += v_loss.item()
                     val_files_counted += 1
 
         # Use files_with_loss (not total train_size) so skipped-NaN files don't
@@ -392,6 +456,14 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
         avg_val_loss = val_loss / val_files_counted if val_files_counted > 0 else float('nan')
 
         print(f"Epoch {epoch + 1}/{epochs} | Avg Train BCE Loss: {avg_train_loss:.4f} | Avg Val BCE Loss: {avg_val_loss:.4f}")
+
+        # Append to loss history file
+        loss_log = os.path.join(os.path.dirname(checkpoint_path) or '.', 'loss_history_dropout03.csv')
+        if not os.path.exists(loss_log):
+            with open(loss_log, 'w') as f:
+                f.write('epoch,train_loss,val_loss\n')
+        with open(loss_log, 'a') as f:
+            f.write(f'{epoch + 1},{avg_train_loss:.4f},{avg_val_loss:.4f}\n')
 
         if torch.isfinite(torch.tensor(avg_val_loss)):
             scheduler.step(avg_val_loss)
@@ -416,13 +488,9 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
 
 
 ZIP_PATH = 'training_tensors.zip'
-CHECKPOINT_PATH = 'pedal_bilstm_checkpoint.pt'
+CHECKPOINT_PATH = 'pedal_bilstm_dropout03_checkpoint.pt'
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--tensor-dir', type=str, default=None,
-                        help='Absolute path to extracted training tensor folder (e.g. E:/training_tensors)')
-    args = parser.parse_args()
-    folder_paths = [args.tensor_dir] if args.tensor_dir else None
+    tensor_dir = input("Path to extracted training tensor folder (leave blank to use zip): ").strip()
+    folder_paths = [tensor_dir] if tensor_dir else None
     train_bilstm(ZIP_PATH, CHECKPOINT_PATH, folder_paths=folder_paths)
