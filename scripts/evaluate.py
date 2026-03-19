@@ -1,3 +1,5 @@
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
