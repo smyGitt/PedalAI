@@ -63,7 +63,7 @@ class PedalDataset(Dataset):
 
 
 class BiLSTMPedalRegressor(nn.Module):
-    def __init__(self, input_size=140, hidden_size=256, num_layers=2, dropout=0.3):
+    def __init__(self, input_size=140, hidden_size=256, num_layers=2, dropout=0.5):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_size,
@@ -458,7 +458,7 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
         print(f"Epoch {epoch + 1}/{epochs} | Avg Train BCE Loss: {avg_train_loss:.4f} | Avg Val BCE Loss: {avg_val_loss:.4f}")
 
         # Append to loss history file
-        loss_log = os.path.join(os.path.dirname(checkpoint_path) or '.', 'loss_history_dropout03.csv')
+        loss_log = os.path.join(os.path.dirname(checkpoint_path) or '.', 'loss_history_dropout05.csv')
         if not os.path.exists(loss_log):
             with open(loss_log, 'w') as f:
                 f.write('epoch,train_loss,val_loss\n')
@@ -488,7 +488,7 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
 
 
 ZIP_PATH = 'training_tensors.zip'
-CHECKPOINT_PATH = 'pedal_bilstm_dropout03_checkpoint.pt'
+CHECKPOINT_PATH = 'pedal_bilstm_dropout05_checkpoint.pt'
 
 if __name__ == '__main__':
     tensor_dir = input("Path to extracted training tensor folder (leave blank to use zip): ").strip()
