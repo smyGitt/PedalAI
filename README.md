@@ -1,3 +1,14 @@
+# Copyright & Intended Use
+
+This model was trained on copyrighted musical data under permissive dataset licenses. 
+Please see [INTENDED_USE.md](INTENDED_USE.md) for details on training data provenance, 
+memorization considerations, and the scope of this project.
+
+## Legal Considerations
+This model is trained on the POP909 (MIT) and GiantMIDI-Piano (CC BY 4.0) datasets. While both carry permissive licenses, there is ongoing legal debate over whether such licenses fully cover the use of data for training generative or predictive ML models.
+Notably, Dornis and Stober (2026) argue that training generative AI models is legally distinct from traditional text and data mining, and that existing exceptions (EU TDM, US fair use) may not apply. They also note that datasets originally created for one research purpose may carry additional legal uncertainty when repurposed for model training. For further reading, see: Generative AI Training and Copyright Law (arXiv:2502.15858).
+This project is provided under the MIT License and is intended for research and educational use. It does not constitute legal guidance. Users who plan to build on this work, particularly in commercial contexts, should evaluate applicable licensing terms independently.
+
 # Dataset Credits
 
 ### [POP909](https://github.com/music-x-lab/POP909-Dataset)
