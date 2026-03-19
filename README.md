@@ -1,3 +1,9 @@
+# Copyright & Intended Use
+
+This model was trained on copyrighted musical data under permissive dataset licenses. 
+Please see [INTENDED_USE.md](INTENDED_USE.md) for details on training data provenance, 
+memorization considerations, and the scope of this project.
+
 # Dataset Credits
 
 ### [POP909](https://github.com/music-x-lab/POP909-Dataset)
