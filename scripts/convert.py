@@ -130,7 +130,7 @@ if __name__ == "__main__":
     # Shared output directory for all datasets.
     # Both POP909 and GiantMIDI tensors are written here and mixed automatically
     # by the DataLoader during training.
-    OUTPUT_TENSOR_DIR = r"F:\training_tensors"
+    OUTPUT_TENSOR_DIR = r"C:\Users\kevin\Documents\VSCODE\PedalAI\training_tensors_new"
 
     # --- POP909 ---
     POP909_FOLDER = "POP909"

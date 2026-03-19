@@ -8,8 +8,6 @@ from tqdm import tqdm
 
 
 class PedalDataset(Dataset):
-    MANIFEST_NAME = 'training_tensors_manifest.txt'
-
     def __init__(self, zip_path, folder_paths=None):
         """Load .pt files from an extracted folder (preferred) or zip fallback.
 
@@ -24,18 +22,13 @@ class PedalDataset(Dataset):
 
         # Try extracted folder — much faster I/O than zip
         for folder in (folder_paths or []):
-            manifest = os.path.join(folder, self.MANIFEST_NAME)
-            if os.path.isdir(folder) and os.path.exists(manifest):
-                with open(manifest, 'r') as f:
-                    self.names = [line.strip() for line in f if line.strip()]
-                folder_files = set(os.listdir(folder))
-                if all(n in folder_files for n in self.names):
+            if os.path.isdir(folder):
+                pt_files = sorted(f for f in os.listdir(folder) if f.endswith('.pt'))
+                if pt_files:
                     self.folder = folder
+                    self.names = pt_files
                     print(f"Using extracted folder: {folder} ({len(self.names)} files)")
                     break
-                else:
-                    missing = [n for n in self.names if n not in folder_files]
-                    print(f"[WARNING] Folder {folder} is missing {len(missing)} files, falling back to zip")
 
         # Fall back to zip
         if self.folder is None:
