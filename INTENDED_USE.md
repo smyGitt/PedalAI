@@ -33,7 +33,7 @@ PedalAI was trained on pedal and note data extracted from two publicly available
 | Dataset | License | Content | Notes |
 |---|---|---|---|
 | [POP909](https://github.com/music-x-lab/POP909-Dataset) | MIT (dataset) | MIDI arrangements of 909 Chinese pop songs | The underlying compositions are copyrighted works. The MIT license covers the dataset artifact (MIDI transcriptions and annotations), not the original songs. |
-| [GiantMIDI-Piano](https://github.com/bytedance/GiantMIDI-Piano) | CC BY 4.0 (dataset) | ~10,855 classical piano works transcribed from YouTube recordings | Compositions are largely public domain. The CC BY 4.0 license covers the transcribed MIDI data. Source recordings may carry performer's rights in some jurisdictions. |
+| [GiantMIDI-Piano](https://github.com/bytedance/GiantMIDI-Piano) | CC BY 4.0 (dataset) | 7,235 classical piano works transcribed from YouTube recordings | Compositions are largely public domain. The CC BY 4.0 license covers the transcribed MIDI data. Source recordings may carry performer's rights in some jurisdictions. |
 
 Neither dataset's license conclusively settles the copyright status of models trained on their contents. This is an unresolved area of law. See the discussion below.
 
