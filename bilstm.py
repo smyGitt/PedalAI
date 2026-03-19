@@ -169,8 +169,8 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
         file_offset = checkpoint.get('file_offset', 0)
         print(f"Resumed from epoch {start_epoch}, file offset {file_offset}")
 
-    CHUNK_SIZE = 512
-    MAX_BATCH_CHUNKS = 200  # ~102,400 frames (~34 min at 50Hz) — OOM safety cap
+    CHUNK_SIZE = 1024
+    MAX_BATCH_CHUNKS = 200  # ~204,800 frames (~68 min at 50Hz) — OOM safety cap
     # Abort training if this many consecutive NaN events (chunks or file-level
     # grad checks) occur without a successful optimizer step in between.
     MAX_CONSECUTIVE_NAN = 20
