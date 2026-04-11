@@ -1,14 +1,18 @@
+# AI agents: before changing training, data shapes, or checkpoint format, read:
+#   docs/BILSTM_PIPELINE_REFERENCE.md — §3 Core module (bilstm.py) and §4 Training loop.
 import io
+import json
 import os
+import random
 import zipfile
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 
 class PedalDataset(Dataset):
-    def __init__(self, zip_path, folder_paths=None):
+    def __init__(self, zip_path, folder_paths=None, excluded_names=None):
         """Load .pt files from an extracted folder (preferred) or zip fallback.
 
         Args:
@@ -20,10 +24,12 @@ class PedalDataset(Dataset):
         self.folder = None
         self.zip_path = None
 
+        excluded_names = excluded_names or set()
+
         # Try extracted folder — much faster I/O than zip
         for folder in (folder_paths or []):
             if os.path.isdir(folder):
-                pt_files = sorted(f for f in os.listdir(folder) if f.endswith('.pt'))
+                pt_files = sorted(f for f in os.listdir(folder) if f.endswith('.pt') and f not in excluded_names)
                 if pt_files:
                     self.folder = folder
                     self.names = pt_files
@@ -34,7 +40,7 @@ class PedalDataset(Dataset):
         if self.folder is None:
             self.zip_path = zip_path
             with zipfile.ZipFile(zip_path, 'r') as zf:
-                self.names = [os.path.basename(n) for n in zf.namelist() if n.endswith('.pt')]
+                self.names = [os.path.basename(n) for n in zf.namelist() if n.endswith('.pt') and os.path.basename(n) not in excluded_names]
             print(f"Using zip archive: {zip_path} ({len(self.names)} files)")
 
     def __len__(self):
@@ -96,7 +102,78 @@ def _has_nan_weights(model):
     return [n for n, p in model.named_parameters() if not torch.isfinite(p).all()]
 
 
-def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_every_n_files=50, validation_split=0.1):
+def _load_glitch_exclusions(distribution_json, min_avg_press_ms):
+    """Return a set of filenames to exclude based on avg press duration.
+
+    Files with avg_press_ms below min_avg_press_ms are MIDI transcription
+    glitches — pedal blips too short to be intentional musical gestures.
+    Files with zero presses are not excluded here (no avg_press_ms to judge).
+    """
+    if not os.path.exists(distribution_json):
+        print(f"[WARNING] pedal_distribution.json not found at '{distribution_json}'. No glitch filtering applied.")
+        return set()
+
+    with open(distribution_json, 'r') as f:
+        data = json.load(f)
+
+    excluded = {
+        d['file'] for d in data.get('file_details', [])
+        if d['presses'] > 0 and d['avg_press_ms'] < min_avg_press_ms
+    }
+    print(f"Glitch filter (<{min_avg_press_ms}ms avg press): excluding {len(excluded)} files.")
+    return excluded
+
+
+def _build_epoch_split_indices(
+    dataset_size,
+    validation_split,
+    epoch,
+    split_seed=42,
+    val_jitter_max=500,
+    min_val_ratio=0.02,
+    max_val_ratio=0.25,
+):
+    """Build deterministic, disjoint train/val indices for one epoch."""
+    if dataset_size < 2:
+        raise ValueError(f"Need at least 2 tensors for train/val split, found {dataset_size}.")
+
+    g = torch.Generator().manual_seed(split_seed + epoch)
+    base_val = int(round(dataset_size * validation_split))
+    jitter = int(torch.randint(-val_jitter_max, val_jitter_max + 1, (1,), generator=g).item()) if val_jitter_max > 0 else 0
+
+    min_val = max(1, int(round(dataset_size * min_val_ratio)))
+    max_val = min(dataset_size - 1, int(round(dataset_size * max_val_ratio)))
+    if max_val < min_val:
+        # Tiny dataset fallback: still enforce disjoint non-empty splits.
+        min_val = 1
+        max_val = dataset_size - 1
+
+    raw_val = base_val + jitter
+    val_size = max(min_val, min(max_val, raw_val))
+    train_size = dataset_size - val_size
+    if train_size < 1:
+        raise ValueError(f"Invalid split (train_size={train_size}, val_size={val_size}) for dataset_size={dataset_size}.")
+
+    perm = torch.randperm(dataset_size, generator=g).tolist()
+    val_indices = perm[:val_size]
+    train_indices = perm[val_size:]
+    return train_indices, val_indices, base_val, jitter
+
+
+def train_bilstm(
+    zip_path,
+    checkpoint_path,
+    folder_paths=None,
+    epochs=10,
+    save_every_n_files=50,
+    validation_split=0.1,
+    split_seed=42,
+    val_jitter_max=500,
+    min_val_ratio=0.02,
+    max_val_ratio=0.25,
+    min_avg_press_ms=150,
+    distribution_json='scripts/pedal_distribution.json',
+):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Training on: {device}")
 
@@ -105,23 +182,9 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
 
-    dataset = PedalDataset(zip_path, folder_paths=folder_paths)
+    excluded = _load_glitch_exclusions(distribution_json, min_avg_press_ms)
+    dataset = PedalDataset(zip_path, folder_paths=folder_paths, excluded_names=excluded)
     dataset_size = len(dataset)
-    val_size = int(dataset_size * validation_split)
-    train_size = dataset_size - val_size
-    # Fixed seed ensures the same train/val split across runs, so resumed
-    # training never leaks validation files into the training set.
-    split_gen = torch.Generator().manual_seed(42)
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=split_gen)
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-    )
 
     model = BiLSTMPedalRegressor().to(device)
 
@@ -131,7 +194,9 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
 
     # BCEWithLogitsLoss expects raw logits; sigmoid is applied internally for stability.
     # reduction='none' returns per-element loss, allowing masked averaging for padded chunks.
-    criterion = nn.BCEWithLogitsLoss(reduction='none')
+    # pos_weight < 1 reduces the penalty for false negatives (missing ON frames), which
+    # counteracts the model's tendency to over-predict ON in a majority-ON dataset.
+    criterion = nn.BCEWithLogitsLoss(reduction='none', pos_weight=torch.tensor(0.56).to(device))
 
     # AMP GradScaler is only meaningful on CUDA. When disabled (CPU), it is a
     # transparent no-op — but critically it does NOT provide NaN/Inf guard on CPU,
@@ -160,40 +225,93 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
         start_epoch = checkpoint['epoch']
         file_offset = checkpoint.get('file_offset', 0)
+
+        # If split config changes between runs, a mid-epoch resume (file_offset > 0)
+        # could skip the wrong examples. Detect and reset offset to avoid silent corruption.
+        split_mismatches = []
+        if checkpoint.get('split_seed', split_seed) != split_seed:
+            split_mismatches.append(f"split_seed ckpt={checkpoint.get('split_seed')} run={split_seed}")
+        if checkpoint.get('validation_split', validation_split) != validation_split:
+            split_mismatches.append(f"validation_split ckpt={checkpoint.get('validation_split')} run={validation_split}")
+        if checkpoint.get('val_jitter_max', val_jitter_max) != val_jitter_max:
+            split_mismatches.append(f"val_jitter_max ckpt={checkpoint.get('val_jitter_max')} run={val_jitter_max}")
+        if checkpoint.get('min_val_ratio', min_val_ratio) != min_val_ratio:
+            split_mismatches.append(f"min_val_ratio ckpt={checkpoint.get('min_val_ratio')} run={min_val_ratio}")
+        if checkpoint.get('max_val_ratio', max_val_ratio) != max_val_ratio:
+            split_mismatches.append(f"max_val_ratio ckpt={checkpoint.get('max_val_ratio')} run={max_val_ratio}")
+        if checkpoint.get('min_avg_press_ms', min_avg_press_ms) != min_avg_press_ms:
+            split_mismatches.append(f"min_avg_press_ms ckpt={checkpoint.get('min_avg_press_ms')} run={min_avg_press_ms}")
+
+        if split_mismatches:
+            print("[WARNING] Split config mismatch on resume:")
+            for m in split_mismatches:
+                print(f"  - {m}")
+            if file_offset > 0:
+                print("[WARNING] Resetting file_offset to 0 due to split mismatch (avoids skipping wrong tensors).")
+                file_offset = 0
+
         print(f"Resumed from epoch {start_epoch}, file offset {file_offset}")
 
     CHUNK_SIZE = 1024
-    MAX_BATCH_CHUNKS = 200  # ~204,800 frames (~68 min at 50Hz) — OOM safety cap
+    CONTEXT_SIZE = 256      # extra frames on each side for context-sensitive chunking
+    WINDOW_SIZE = 2 * CONTEXT_SIZE + CHUNK_SIZE  # full width fed to BiLSTM per chunk
+    MAX_BATCH_CHUNKS = 133  # ~204,288 frames at WINDOW_SIZE=1536 — same VRAM cap as before
     # Abort training if this many consecutive NaN events (chunks or file-level
     # grad checks) occur without a successful optimizer step in between.
     MAX_CONSECUTIVE_NAN = 20
     # Abort if this fraction of files in an epoch produce NaN — indicates broad data corruption
     MAX_NAN_RATIO = 0.25
 
-    # Create sampler and DataLoader once; reseed the generator each epoch so
-    # persistent_workers stay alive across epochs instead of being respawned.
-    train_gen = torch.Generator()
-    train_sampler = torch.utils.data.RandomSampler(train_dataset, generator=train_gen)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=1,
-        sampler=train_sampler,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4,
-    )
-
     for epoch in range(start_epoch, epochs):
-        # Reseed the sampler's generator — deterministic shuffle per epoch,
-        # same file order reproduced on resume.
-        train_gen.manual_seed(epoch)
+        train_indices, val_indices, base_val, jitter = _build_epoch_split_indices(
+            dataset_size=dataset_size,
+            validation_split=validation_split,
+            epoch=epoch,
+            split_seed=split_seed,
+            val_jitter_max=val_jitter_max,
+            min_val_ratio=min_val_ratio,
+            max_val_ratio=max_val_ratio,
+        )
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(dataset, val_indices)
 
-        # Separate generator with the same seed to pre-compute the permutation
-        # for filename lookup without consuming the sampler's generator state.
-        sampler_order = torch.randperm(len(train_dataset), generator=torch.Generator().manual_seed(epoch)).tolist()
+        # Deterministic file order within each epoch (for reproducibility and resume).
+        order_seed = split_seed + 10_000 + epoch
+        train_sampler = torch.utils.data.RandomSampler(
+            train_dataset,
+            generator=torch.Generator().manual_seed(order_seed),
+        )
+        sampler_order = torch.randperm(
+            len(train_dataset),
+            generator=torch.Generator().manual_seed(order_seed),
+        ).tolist()
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=1,
+            sampler=train_sampler,
+            num_workers=8,
+            pin_memory=False,
+            persistent_workers=False,
+            prefetch_factor=4,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=False,
+            persistent_workers=False,
+        )
+        print(
+            f"Epoch {epoch + 1} split: train={len(train_dataset)} val={len(val_dataset)} "
+            f"(base_val={base_val}, jitter={jitter:+d})"
+        )
 
         epoch_offset = file_offset if epoch == start_epoch else 0
+        if epoch_offset >= len(train_dataset):
+            print(f"[WARNING] file_offset {epoch_offset} exceeds train split size {len(train_dataset)}; resetting to 0.")
+            epoch_offset = 0
         model.train()
         running_loss = 0.0
         total_files = 0       # total files iterated this epoch
@@ -214,7 +332,7 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
 
         epoch_iterator = tqdm(
             train_iter,
-            total=train_size,
+            total=len(train_dataset),
             initial=epoch_offset,
             desc=f"Epoch {epoch + 1}/{epochs} [Train]",
             unit="file",
@@ -237,6 +355,16 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
             T = x_full.shape[1]
             file_loss = 0.0
             file_had_nan = False
+
+            # Technique 1: Random chunk offset — shifts boundary positions each
+            # file so the model doesn't overfit to fixed chunk boundaries.
+            # Only applied when T > CHUNK_SIZE (single-chunk files have no boundary).
+            offset = random.randint(0, CHUNK_SIZE - 1) if T > CHUNK_SIZE else 0
+            if offset > 0:
+                x_full = x_full[:, offset:, :]
+                y_full = y_full[:, offset:]
+                T = x_full.shape[1]
+
             num_total_chunks = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
 
             # Pad sequence to exact multiple of CHUNK_SIZE for batched processing
@@ -245,8 +373,11 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
                 x_full = torch.nn.functional.pad(x_full, (0, 0, 0, pad_len))
                 y_full = torch.nn.functional.pad(y_full, (0, pad_len))
 
-            # Reshape (1, T_padded, F) -> (num_chunks, CHUNK_SIZE, F)
-            x_chunks = x_full.squeeze(0).view(num_total_chunks, CHUNK_SIZE, -1)
+            # Technique 2: Context-sensitive chunking — each chunk is padded with
+            # CONTEXT_SIZE extra frames on each side so the BiLSTM has neighboring
+            # context at boundaries. Loss is computed only on the center frames.
+            x_ctx = torch.nn.functional.pad(x_full, (0, 0, CONTEXT_SIZE, CONTEXT_SIZE))
+            x_chunks = x_ctx.squeeze(0).unfold(0, WINDOW_SIZE, CHUNK_SIZE).permute(0, 2, 1).contiguous()
             y_chunks = y_full.squeeze(0).view(num_total_chunks, CHUNK_SIZE)
 
             optimizer.zero_grad(set_to_none=True)
@@ -254,7 +385,8 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
             if num_total_chunks <= MAX_BATCH_CHUNKS:
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                     out_chunks = model(x_chunks).squeeze(-1)
-                    per_element_loss = criterion(out_chunks, y_chunks)
+                    out_center = out_chunks[:, CONTEXT_SIZE:CONTEXT_SIZE + CHUNK_SIZE]
+                    per_element_loss = criterion(out_center, y_chunks)
                     if pad_len > 0:
                         mask = torch.ones_like(y_chunks)
                         mask[-1, CHUNK_SIZE - pad_len:] = 0.0
@@ -273,7 +405,8 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
                     y_sb = y_chunks[sb_start:sb_end]
                     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                         out_sb = model(x_sb).squeeze(-1)
-                        sb_loss = criterion(out_sb, y_sb)
+                        out_sb_center = out_sb[:, CONTEXT_SIZE:CONTEXT_SIZE + CHUNK_SIZE]
+                        sb_loss = criterion(out_sb_center, y_sb)
                         if sb_end == num_total_chunks and pad_len > 0:
                             mask = torch.ones_like(y_sb)
                             mask[-1, CHUNK_SIZE - pad_len:] = 0.0
@@ -364,6 +497,12 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
                     _save_checkpoint(checkpoint_path, {
                         'epoch': epoch,
                         'file_offset': file_idx + 1,
+                        'split_seed': split_seed,
+                        'validation_split': validation_split,
+                        'val_jitter_max': val_jitter_max,
+                        'min_val_ratio': min_val_ratio,
+                        'max_val_ratio': max_val_ratio,
+                        'min_avg_press_ms': min_avg_press_ms,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
@@ -408,13 +547,16 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
                     x_val = torch.nn.functional.pad(x_val, (0, 0, 0, pad_len))
                     y_val = torch.nn.functional.pad(y_val, (0, pad_len))
 
-                x_vchunks = x_val.squeeze(0).view(num_val_chunks, CHUNK_SIZE, -1)
+                # Context-sensitive chunking for validation (no random offset)
+                x_val_ctx = torch.nn.functional.pad(x_val, (0, 0, CONTEXT_SIZE, CONTEXT_SIZE))
+                x_vchunks = x_val_ctx.squeeze(0).unfold(0, WINDOW_SIZE, CHUNK_SIZE).permute(0, 2, 1).contiguous()
                 y_vchunks = y_val.squeeze(0).view(num_val_chunks, CHUNK_SIZE)
 
                 if num_val_chunks <= MAX_BATCH_CHUNKS:
                     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                         out_vchunks = model(x_vchunks).squeeze(-1)
-                        per_element_loss = criterion(out_vchunks, y_vchunks)
+                        out_vcenter = out_vchunks[:, CONTEXT_SIZE:CONTEXT_SIZE + CHUNK_SIZE]
+                        per_element_loss = criterion(out_vcenter, y_vchunks)
                         if pad_len > 0:
                             mask = torch.ones_like(y_vchunks)
                             mask[-1, CHUNK_SIZE - pad_len:] = 0.0
@@ -428,7 +570,8 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
                         sb_end = min(sb_start + MAX_BATCH_CHUNKS, num_val_chunks)
                         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                             out_sb = model(x_vchunks[sb_start:sb_end]).squeeze(-1)
-                            sb_loss = criterion(out_sb, y_vchunks[sb_start:sb_end])
+                            out_sb_center = out_sb[:, CONTEXT_SIZE:CONTEXT_SIZE + CHUNK_SIZE]
+                            sb_loss = criterion(out_sb_center, y_vchunks[sb_start:sb_end])
                             if sb_end == num_val_chunks and pad_len > 0:
                                 mask = torch.ones_like(y_vchunks[sb_start:sb_end])
                                 mask[-1, CHUNK_SIZE - pad_len:] = 0.0
@@ -451,7 +594,7 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
         print(f"Epoch {epoch + 1}/{epochs} | Avg Train BCE Loss: {avg_train_loss:.4f} | Avg Val BCE Loss: {avg_val_loss:.4f}")
 
         # Append to loss history file
-        loss_log = os.path.join(os.path.dirname(checkpoint_path) or '.', 'loss_history_dropout05.csv')
+        loss_log = os.path.join(os.path.dirname(checkpoint_path) or '.', 'loss_history_dropout05_ctx.csv')
         if not os.path.exists(loss_log):
             with open(loss_log, 'w') as f:
                 f.write('epoch,train_loss,val_loss\n')
@@ -473,6 +616,12 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
         _save_checkpoint(checkpoint_path, {
             'epoch': epoch + 1,
             'file_offset': 0,
+            'split_seed': split_seed,
+            'validation_split': validation_split,
+            'val_jitter_max': val_jitter_max,
+            'min_val_ratio': min_val_ratio,
+            'max_val_ratio': max_val_ratio,
+            'min_avg_press_ms': min_avg_press_ms,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
@@ -481,7 +630,7 @@ def train_bilstm(zip_path, checkpoint_path, folder_paths=None, epochs=10, save_e
 
 
 ZIP_PATH = 'training_tensors.zip'
-CHECKPOINT_PATH = 'pedal_bilstm_dropout05_checkpoint.pt'
+CHECKPOINT_PATH = 'pedal_bilstm_dropout05_ctx_pw_checkpoint.pt'
 
 if __name__ == '__main__':
     tensor_dir = input("Path to extracted training tensor folder (leave blank to use zip): ").strip()
